@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test"
+import { Output } from "ai"
+import { z } from "zod"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionPrompt } from "../../src/session/prompt"
 import { SessionID, MessageID } from "../../src/session/schema"
@@ -156,231 +158,69 @@ describe("structured-output.AssistantMessage", () => {
   })
 })
 
-describe("structured-output.createStructuredOutputTool", () => {
-  test("creates tool with correct id", () => {
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: { type: "object", properties: { name: { type: "string" } } },
-      onSuccess: () => {},
-    })
-
-    // AI SDK tool type doesn't expose id, but we set it internally
-    expect((tool as any).id).toBe("StructuredOutput")
+describe("structured-output.helpers", () => {
+  test("preferStructured keeps existing value when next output is undefined", () => {
+    expect(SessionPrompt.preferStructured({ ok: true }, undefined)).toEqual({ ok: true })
+    expect(SessionPrompt.preferStructured(undefined, { ok: true })).toEqual({ ok: true })
+    expect(SessionPrompt.preferStructured({ ok: true }, { ok: false })).toEqual({ ok: false })
   })
 
-  test("creates tool with description", () => {
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: { type: "object" },
-      onSuccess: () => {},
-    })
+  test("planner output schema carries planner-specific field descriptions", () => {
+    const schema = z.toJSONSchema(SessionPrompt.plannerOutputSchema()) as any
 
-    expect(tool.description).toContain("structured format")
+    expect(schema.properties.completed_steps.description).toContain("already verified from the history")
+    expect(schema.properties.completed_steps.description).toContain("unless it is actually done")
+    expect(schema.properties.remaining_steps.description).toContain("meaningful phases still left")
+    expect(schema.properties.remaining_steps.description).toContain("not implementation details")
+    expect(schema.properties.current_step.description).toContain("best immediate next move")
+    expect(schema.properties.selected_tools.description).toContain("exact capability names")
+    expect(schema.properties.selected_tools.description).toContain("functions.read")
+    expect(schema.properties.selected_tools.description).toContain("no more tool use is required")
   })
 
-  test("creates tool with schema as inputSchema", () => {
-    const schema = {
-      type: "object",
-      properties: {
-        company: { type: "string" },
-        founded: { type: "number" },
-      },
-      required: ["company"],
-    }
-
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema,
-      onSuccess: () => {},
-    })
-
-    // AI SDK wraps schema in { jsonSchema: {...} }
-    expect(tool.inputSchema).toBeDefined()
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.properties?.company).toBeDefined()
-    expect(inputSchema.jsonSchema?.properties?.founded).toBeDefined()
+  test("planner native output schema is compatible with AI SDK", () => {
+    expect(() =>
+      Output.object({
+        schema: SessionPrompt.plannerOutputSchema() as any,
+      }),
+    ).not.toThrow()
   })
 
-  test("strips $schema property from inputSchema", () => {
-    const schema = {
-      $schema: "http://json-schema.org/draft-07/schema#",
-      type: "object",
-      properties: { name: { type: "string" } },
-    }
-
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema,
-      onSuccess: () => {},
+  test("parseStructuredText parses plain JSON objects", () => {
+    expect(SessionPrompt.parseStructuredText(`{"name":"Test Company"}`)).toEqual({
+      name: "Test Company",
     })
-
-    // AI SDK wraps schema in { jsonSchema: {...} }
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.$schema).toBeUndefined()
   })
 
-  test("execute calls onSuccess with valid args", async () => {
-    let capturedOutput: unknown
-
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: { type: "object", properties: { name: { type: "string" } } },
-      onSuccess: (output) => {
-        capturedOutput = output
-      },
-    })
-
-    expect(tool.execute).toBeDefined()
-    const testArgs = { name: "Test Company" }
-    const result = await tool.execute!(testArgs, {
-      toolCallId: "test-call-id",
-      messages: [],
-      abortSignal: undefined as any,
-    })
-
-    expect(capturedOutput).toEqual(testArgs)
-    expect(result.output).toBe("Structured output captured successfully.")
-    expect(result.metadata.valid).toBe(true)
+  test("parseStructuredText parses fenced JSON", () => {
+    expect(
+      SessionPrompt.parseStructuredText("```json\n{\"tags\":[\"a\",\"b\",\"c\"]}\n```"),
+    ).toEqual({ tags: ["a", "b", "c"] })
   })
 
-  test("AI SDK validates schema before execute - missing required field", async () => {
-    // Note: The AI SDK validates the input against the schema BEFORE calling execute()
-    // So invalid inputs never reach the tool's execute function
-    // This test documents the expected schema behavior
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          name: { type: "string" },
-          age: { type: "number" },
-        },
-        required: ["name", "age"],
-      },
-      onSuccess: () => {},
-    })
-
-    // The schema requires both 'name' and 'age'
-    expect(tool.inputSchema).toBeDefined()
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.required).toContain("name")
-    expect(inputSchema.jsonSchema?.required).toContain("age")
+  test("parseStructuredText returns undefined for invalid JSON", () => {
+    expect(SessionPrompt.parseStructuredText(`{"name":"missing"`)).toBeUndefined()
+    expect(SessionPrompt.parseStructuredText(`name: test`)).toBeUndefined()
   })
 
-  test("AI SDK validates schema types before execute - wrong type", async () => {
-    // Note: The AI SDK validates the input against the schema BEFORE calling execute()
-    // So invalid inputs never reach the tool's execute function
-    // This test documents the expected schema behavior
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          count: { type: "number" },
-        },
-        required: ["count"],
-      },
-      onSuccess: () => {},
-    })
-
-    // The schema defines 'count' as a number
-    expect(tool.inputSchema).toBeDefined()
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.properties?.count?.type).toBe("number")
+  test("parseStructuredText keeps the last valid JSON candidate", () => {
+    expect(
+      SessionPrompt.parseStructuredText(
+        `{"type":"object","name":"first"}\n{"name":"second"}`,
+      ),
+    ).toEqual({ name: "second" })
   })
 
-  test("execute handles nested objects", async () => {
-    let capturedOutput: unknown
-
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          user: {
-            type: "object",
-            properties: {
-              name: { type: "string" },
-              email: { type: "string" },
-            },
-            required: ["name"],
-          },
-        },
-        required: ["user"],
-      },
-      onSuccess: (output) => {
-        capturedOutput = output
-      },
-    })
-
-    // Valid nested object - AI SDK validates before calling execute()
-    const validResult = await tool.execute!(
-      { user: { name: "John", email: "john@test.com" } },
-      {
-        toolCallId: "test-call-id",
-        messages: [],
-        abortSignal: undefined as any,
-      },
+  test("parseStructuredText can select a schema-matching candidate", () => {
+    const match = SessionPrompt.parseStructuredText(
+      `{"type":"object","completed_steps":["a"],"remaining_steps":["b"],"current_step":"c","selected_tools":["glob"]}\n{"completed_steps":["x"],"remaining_steps":["y"],"current_step":"z","selected_tools":["read"]}`,
+      (value) => SessionPrompt.plannerOutputSchema().safeParse(value).success,
     )
-
-    expect(capturedOutput).toEqual({ user: { name: "John", email: "john@test.com" } })
-    expect(validResult.metadata.valid).toBe(true)
-
-    // Verify schema has correct nested structure
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.properties?.user?.type).toBe("object")
-    expect(inputSchema.jsonSchema?.properties?.user?.properties?.name?.type).toBe("string")
-    expect(inputSchema.jsonSchema?.properties?.user?.required).toContain("name")
-  })
-
-  test("execute handles arrays", async () => {
-    let capturedOutput: unknown
-
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: {
-        type: "object",
-        properties: {
-          tags: {
-            type: "array",
-            items: { type: "string" },
-          },
-        },
-        required: ["tags"],
-      },
-      onSuccess: (output) => {
-        capturedOutput = output
-      },
+    expect(match).toEqual({
+      completed_steps: ["x"],
+      remaining_steps: ["y"],
+      current_step: "z",
+      selected_tools: ["read"],
     })
-
-    // Valid array - AI SDK validates before calling execute()
-    const validResult = await tool.execute!(
-      { tags: ["a", "b", "c"] },
-      {
-        toolCallId: "test-call-id",
-        messages: [],
-        abortSignal: undefined as any,
-      },
-    )
-
-    expect(capturedOutput).toEqual({ tags: ["a", "b", "c"] })
-    expect(validResult.metadata.valid).toBe(true)
-
-    // Verify schema has correct array structure
-    const inputSchema = tool.inputSchema as any
-    expect(inputSchema.jsonSchema?.properties?.tags?.type).toBe("array")
-    expect(inputSchema.jsonSchema?.properties?.tags?.items?.type).toBe("string")
   })
-
-  test("toModelOutput returns text value", () => {
-    const tool = SessionPrompt.createStructuredOutputTool({
-      schema: { type: "object" },
-      onSuccess: () => {},
-    })
-
-    expect(tool.toModelOutput).toBeDefined()
-    const modelOutput = tool.toModelOutput!({
-      output: "Test output",
-      title: "Test",
-      metadata: { valid: true },
-    })
-
-    expect(modelOutput.type).toBe("text")
-    expect(modelOutput.value).toBe("Test output")
-  })
-
-  // Note: Retry behavior is handled by the AI SDK and the prompt loop, not the tool itself
-  // The tool simply calls onSuccess when execute() is called with valid args
-  // See prompt.ts loop() for actual retry logic
 })

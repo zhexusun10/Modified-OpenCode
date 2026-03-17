@@ -267,9 +267,23 @@ export namespace MessageV2 {
   export const DebugPart = PartBase.extend({
     type: z.literal("debug"),
     request: z.object({
+    meta: z.object({
+      agent: z.string(),
+      mode: z.string(),
+      providerID: z.string(),
+      modelID: z.string(),
+      userID: z.string(),
+      tools: z.string().array(),
+      toolChoice: z.enum(["auto", "required", "none"]).optional(),
+      file: z.string().optional(),
+      source: z.string().optional(),
+      stage: z.string().optional(),
+      step: z.number().int().optional(),
+    }),
       system: z.string().array(),
       instructions: z.string().optional(),
       messages: z.unknown().array(),
+    conversation: z.unknown().array().optional(),
     }),
   }).meta({
     ref: "DebugPart",
@@ -630,6 +644,101 @@ export namespace MessageV2 {
       return { type: "json", value: output as never }
     }
 
+    const clip = (value: unknown, depth = 0): unknown => {
+      if (typeof value === "string") {
+        if (value.length <= 200) return value
+        return `${value.slice(0, 200)}... [${value.length - 200} chars truncated]`
+      }
+      if (!value || typeof value !== "object") return value
+      if (Array.isArray(value)) {
+        if (depth >= 2) return `[${value.length} items]`
+        return value.slice(0, 10).map((item) => clip(item, depth + 1))
+      }
+      if (depth >= 2) return "[Object]"
+      return Object.fromEntries(
+        Object.entries(value)
+          .slice(0, 12)
+          .map(([key, item]) => [
+            key,
+            key === "patchText" ? `[patch omitted: ${typeof item === "string" ? item.length : 0} chars]` : clip(item, depth + 1),
+          ]),
+      )
+    }
+
+    const files = (part: ToolPart) =>
+      "metadata" in part.state && Array.isArray(part.state.metadata?.files)
+        ? part.state.metadata.files
+            .flatMap((item) => {
+              if (typeof item.relativePath === "string" && item.relativePath) return [item.relativePath]
+              if (typeof item.filePath === "string" && item.filePath) return [item.filePath]
+              return []
+            })
+            .slice(0, 20)
+        : []
+
+    const toolInput = (part: ToolPart) => {
+      const input = clip(part.state.input)
+      if (!input || typeof input !== "object" || Array.isArray(input)) return {}
+      const obj = input as Record<string, unknown>
+
+      if (part.tool === "apply_patch") {
+        const list = files(part)
+        return list.length > 0 ? { files: list } : {}
+      }
+
+      if (part.tool === "read") {
+        const path = typeof obj.filePath === "string" ? obj.filePath : typeof obj.path === "string" ? obj.path : undefined
+        return path ? { path } : {}
+      }
+
+      if (part.tool === "glob" || part.tool === "grep") {
+        const pattern = typeof obj.pattern === "string" ? obj.pattern : undefined
+        const path = typeof obj.path === "string" ? obj.path : undefined
+        return {
+          ...(pattern ? { pattern } : {}),
+          ...(path ? { path } : {}),
+        }
+      }
+
+      if (part.tool === "bash") {
+        const command = typeof obj.command === "string" ? obj.command : undefined
+        return command ? { command } : {}
+      }
+
+      if (part.tool === "write" || part.tool === "edit") {
+        const path = typeof obj.filePath === "string" ? obj.filePath : typeof obj.path === "string" ? obj.path : undefined
+        return path ? { path } : {}
+      }
+
+      if (part.tool === "task") {
+        const description = typeof obj.description === "string" ? obj.description : undefined
+        const subagent_type = typeof obj.subagent_type === "string" ? obj.subagent_type : undefined
+        const task_id = typeof obj.task_id === "string" ? obj.task_id : undefined
+        return {
+          ...(description ? { description } : {}),
+          ...(subagent_type ? { subagent_type } : {}),
+          ...(task_id ? { task_id } : {}),
+        }
+      }
+
+      if (part.tool === "webfetch") {
+        const url = typeof obj.url === "string" ? obj.url : undefined
+        return url ? { url } : {}
+      }
+
+      if (part.tool === "websearch") {
+        const query = typeof obj.query === "string" ? obj.query : undefined
+        return query ? { query } : {}
+      }
+
+      if (part.tool === "todowrite") {
+        const todos = Array.isArray(obj.todos) ? obj.todos.length : undefined
+        return typeof todos === "number" ? { count: todos } : {}
+      }
+
+      return input
+    }
+
     for (const msg of input) {
       if (msg.parts.length === 0) continue
 
@@ -697,7 +806,7 @@ export namespace MessageV2 {
           parts: [],
         }
         for (const part of msg.parts) {
-          if (part.type === "text")
+          if (part.type === "text" && !part.ignored)
             assistantMessage.parts.push({
               type: "text",
               text: part.text,
@@ -734,7 +843,7 @@ export namespace MessageV2 {
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-available",
                 toolCallId: part.callID,
-                input: part.state.input,
+                input: toolInput(part),
                 output,
                 ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
               })
@@ -744,7 +853,7 @@ export namespace MessageV2 {
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-error",
                 toolCallId: part.callID,
-                input: part.state.input,
+                input: toolInput(part),
                 errorText: part.state.error,
                 ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
               })
@@ -755,7 +864,7 @@ export namespace MessageV2 {
                 type: ("tool-" + part.tool) as `tool-${string}`,
                 state: "output-error",
                 toolCallId: part.callID,
-                input: part.state.input,
+                input: toolInput(part),
                 errorText: "[Tool execution was interrupted]",
                 ...(differentModel ? {} : { callProviderMetadata: part.metadata }),
               })

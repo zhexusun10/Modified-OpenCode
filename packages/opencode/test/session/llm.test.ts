@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:tes
 import path from "path"
 import type { ModelMessage } from "ai"
 import { LLM } from "../../src/session/llm"
+import { SystemPrompt } from "../../src/session/system"
 import { Global } from "../../src/global"
 import { Instance } from "../../src/project/instance"
 import { Provider } from "../../src/provider/provider"
@@ -13,6 +14,77 @@ import { tmpdir } from "../fixture/fixture"
 import type { Agent } from "../../src/agent/agent"
 import type { MessageV2 } from "../../src/session/message-v2"
 import { SessionID, MessageID } from "../../src/session/schema"
+
+const headerModel: Provider.Model = {
+  id: ModelID.make("test-model"),
+  providerID: ProviderID.make("test"),
+  api: {
+    id: "claude-test",
+    url: "https://example.com",
+    npm: "@ai-sdk/anthropic",
+  },
+  name: "Test Model",
+  capabilities: {
+    temperature: true,
+    reasoning: false,
+    attachment: false,
+    toolcall: true,
+    input: {
+      text: true,
+      audio: false,
+      image: false,
+      video: false,
+      pdf: false,
+    },
+    output: {
+      text: true,
+      audio: false,
+      image: false,
+      video: false,
+      pdf: false,
+    },
+    interleaved: false,
+  },
+  cost: {
+    input: 0,
+    output: 0,
+    cache: {
+      read: 0,
+      write: 0,
+    },
+  },
+  limit: {
+    context: 0,
+    input: 0,
+    output: 0,
+  },
+  status: "active",
+  options: {},
+  headers: {},
+  release_date: "2026-01-01",
+}
+
+describe("session.llm.prelude", () => {
+  test("skips provider header when prompt is explicitly empty", () => {
+    expect(LLM.prelude({ prompt: "", isCodex: false, model: headerModel })).toStrictEqual([])
+  })
+
+  test("uses explicit prompt when provided", () => {
+    expect(LLM.prelude({ prompt: "planner only", isCodex: false, model: headerModel })).toStrictEqual([
+      "planner only",
+    ])
+  })
+
+  test("uses provider header when prompt is absent", () => {
+    expect(LLM.prelude({ prompt: undefined, isCodex: false, model: headerModel })).toStrictEqual(
+      SystemPrompt.provider(headerModel),
+    )
+  })
+
+  test("skips provider header for codex when prompt is absent", () => {
+    expect(LLM.prelude({ prompt: undefined, isCodex: true, model: headerModel })).toStrictEqual([])
+  })
+})
 
 describe("session.llm.hasToolCalls", () => {
   test("returns false for empty messages array", () => {

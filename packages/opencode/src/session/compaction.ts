@@ -220,6 +220,10 @@ When constructing the summary, try to stick to this template:
         },
       ],
       model,
+      debug: {
+        conversation: messages,
+        source: "compaction",
+      },
     })
 
     if (result === "compact") {

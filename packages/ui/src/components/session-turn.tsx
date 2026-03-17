@@ -93,7 +93,7 @@ function partState(part: PartType, showReasoningSummaries: boolean) {
     if (part.tool === "question" && (part.state.status === "pending" || part.state.status === "running")) return
     return "visible" as const
   }
-  if (part.type === "text") return part.text?.trim() ? ("visible" as const) : undefined
+  if (part.type === "text") return !part.ignored && part.text?.trim() ? ("visible" as const) : undefined
   if (part.type === "reasoning") {
     if (showReasoningSummaries && part.text?.trim()) return "visible" as const
     return
@@ -299,7 +299,7 @@ export function SessionTurn(
       const parts = list(data.store.part?.[message.id], emptyParts)
       for (let j = parts.length - 1; j >= 0; j--) {
         const part = parts[j]
-        if (!part || part.type !== "text" || !part.text?.trim()) continue
+        if (!part || part.type !== "text" || part.ignored || !part.text?.trim()) continue
         return part.id
       }
     }

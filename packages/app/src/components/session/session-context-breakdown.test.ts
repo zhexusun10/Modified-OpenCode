@@ -58,4 +58,62 @@ describe("estimateSessionContextBreakdown", () => {
     expect(total).toBeLessThanOrEqual(10)
     expect(output.every((segment) => segment.width <= 100)).toBeTrue()
   })
+
+  test("uses debug request snapshot to classify user assistant and tool context", () => {
+    const messages = [user("u1"), assistant("a1")]
+    const parts = {
+      a1: [
+        {
+          type: "debug",
+          request: {
+            system: ["system prompt"],
+            instructions: "extra instruction",
+            messages: [
+              {
+                role: "user",
+                content: [{ type: "text", text: "hello" }],
+              },
+              {
+                role: "assistant",
+                content: [
+                  { type: "text", text: "done" },
+                  {
+                    type: "tool-call",
+                    toolCallId: "call-1",
+                    toolName: "bash",
+                    input: {},
+                  },
+                ],
+              },
+              {
+                role: "tool",
+                content: [
+                  {
+                    type: "tool-result",
+                    toolCallId: "call-1",
+                    toolName: "bash",
+                    output: { type: "text", value: "ok" },
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      ] as unknown as Part[],
+    }
+
+    const output = estimateSessionContextBreakdown({
+      messages,
+      parts,
+      input: 40,
+      messageID: "a1",
+    })
+
+    const map = Object.fromEntries(output.map((segment) => [segment.key, segment.tokens]))
+    expect(map.system).toBeGreaterThan(0)
+    expect(map.user).toBeGreaterThan(0)
+    expect(map.assistant).toBeGreaterThan(0)
+    expect(map.tool).toBeGreaterThan(0)
+    expect(output.reduce((sum, segment) => sum + segment.tokens, 0)).toBe(40)
+  })
 })

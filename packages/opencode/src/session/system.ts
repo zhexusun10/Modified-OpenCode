@@ -22,6 +22,14 @@ export namespace SystemPrompt {
     return [`## ${title}`, body].join("\n")
   }
 
+  function sections(txt: string) {
+    return txt.trim().split(/\n(?=## )/g)
+  }
+
+  function heading(txt: string) {
+    return txt.split("\n", 1)[0]
+  }
+
   function json(data: unknown) {
     return JSON.stringify(data, null, 2)
   }
@@ -84,31 +92,42 @@ export namespace SystemPrompt {
   export function planner(input: {
     capabilities: ToolRegistry.Capability[]
     state?: unknown
+    retry?: {
+      planner?: string
+      executor?: string
+    }
   }) {
-    return [
-      PROMPT_PLANNER.trim(),
-      block("Capability", json(input.capabilities)),
-      block("Previous Plan", json(input.state ?? null)),
-    ].join("\n\n")
+    return (
+      [
+        PROMPT_PLANNER.trim(),
+        block("Tool Capabilities", json(input.capabilities)),
+        ...(input.state === undefined ? [] : [block("Previous Plan", json(input.state))]),
+        ...(input.retry === undefined ? [] : [block("Retry Context", json(input.retry))]),
+      ].join("\n\n") + "\n"
+    )
   }
 
   export function executor(input: {
     handoff: {
-      reasoning: string
-      planned_actions: {
-        tool_name: string
-        intent: string
-      }[]
+      completed_steps: string[]
+      remaining_steps: string[]
+      current_step: string
+      selected_tools: string[]
     }
-    tools: {
-      name: string
-      description: string
-      schema: Record<string, any>
-    }[]
   }) {
-    return [
-      PROMPT_EXECUTOR.trim(),
-      block("Plan", json(input.handoff)),
-    ].join("\n\n")
+    const finish = input.handoff.selected_tools.length === 0
+    const skip = new Set(
+      finish
+        ? ["## Editing constraints", "## Git and workspace hygiene"]
+        : ["## Presenting your work and final message", "## Final answer structure and style guidelines"],
+    )
+    return (
+      [
+        sections(PROMPT_EXECUTOR)
+          .filter((item) => !skip.has(heading(item)))
+          .join("\n\n"),
+        block("Current Step", input.handoff.current_step),
+      ].join("\n\n") + "\n"
+    )
   }
 }

@@ -18,6 +18,7 @@ import { PermissionNext } from "@/permission/next"
 import { Question } from "@/question"
 import { PartID } from "./schema"
 import type { SessionID, MessageID } from "./schema"
+import path from "path"
 
 export namespace SessionProcessor {
   const DOOM_LOOP_THRESHOLD = 3
@@ -59,6 +60,192 @@ export namespace SessionProcessor {
     await Filesystem.write(file, prev + line + "\n").catch(() => {})
   }
 
+  function debugFile(sessionID: SessionID) {
+    const root = path.resolve(import.meta.dirname, "../../../..")
+    return path.join(root, "debug", `${sessionID}.md`)
+  }
+
+  function fmt(value: unknown) {
+    return JSON.stringify(clean(value), null, 2)
+  }
+
+  function clean(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(clean)
+    if (!value || typeof value !== "object") return value
+    return Object.fromEntries(
+      Object.entries(value)
+        .filter(([key]) => key !== "reasoningEncryptedContent")
+        .map(([key, item]) => [key, clean(item)]),
+    )
+  }
+
+  /** @internal Exported for testing */
+  export function cleanDebug(value: unknown) {
+    return clean(value)
+  }
+
+  function text(title: string, value?: string) {
+    if (!value?.trim()) return ""
+    return [`## ${title}`, "", value.trim()].join("\n")
+  }
+
+  function json(title: string, value: unknown) {
+    if (value === undefined) return ""
+    return [`## ${title}`, "", "```json", fmt(value), "```"].join("\n")
+  }
+
+  function code(title: string, value?: string) {
+    if (!value?.trim()) return ""
+    const text = value.trim()
+    try {
+      return json(title, JSON.parse(text))
+    } catch {
+      return [`## ${title}`, "", "```", text, "```"].join("\n")
+    }
+  }
+
+  function chars(value: unknown) {
+    if (value === undefined) return 0
+    return JSON.stringify(clean(value))?.length ?? 0
+  }
+
+  function ms(value: number | undefined) {
+    if (value === undefined) return ""
+    return `${value}ms`
+  }
+
+  function errmsg(error: NonNullable<MessageV2.Assistant["error"]>) {
+    const msg = error.data?.message
+    if (typeof msg === "string" && msg) return `${error.name}: ${msg}`
+    return error.name
+  }
+
+  function tools(value: string[]) {
+    if (value.length === 0) return "none"
+    return value.join(", ")
+  }
+
+  function stats(msg: MessageV2.WithParts) {
+    if (msg.info.role !== "assistant") return []
+    const time = msg.info.time.completed ? ms(msg.info.time.completed - msg.info.time.created) : ""
+    const tokens = [
+      `input ${msg.info.tokens.input}`,
+      `output ${msg.info.tokens.output}`,
+      `reasoning ${msg.info.tokens.reasoning}`,
+      typeof msg.info.tokens.total === "number" ? `total ${msg.info.tokens.total}` : "",
+      `cache r${msg.info.tokens.cache.read}/w${msg.info.tokens.cache.write}`,
+    ]
+      .filter(Boolean)
+      .join(", ")
+    return [
+      `- Agent: ${msg.info.agent}`,
+      `- Model: ${msg.info.providerID}/${msg.info.modelID}`,
+      msg.info.mode ? `- Mode: ${msg.info.mode}` : "",
+      time ? `- Duration: ${time}` : "",
+      msg.info.finish ? `- Finish: ${msg.info.finish}` : "",
+      `- Cost: ${msg.info.cost}`,
+      `- Tokens: ${tokens}`,
+      msg.info.error ? `- Error: ${errmsg(msg.info.error)}` : "",
+    ].filter(Boolean)
+  }
+
+  function decision(msg: MessageV2.WithParts) {
+    return msg.parts
+      .filter((part): part is MessageV2.TextPart => part.type === "text" && !!part.ignored)
+      .map((part) => part.text.trim())
+      .filter(Boolean)
+      .join("\n\n")
+  }
+
+  function request(item: MessageV2.DebugPart["request"]) {
+    return [
+      `- Agent: ${item.meta.agent}`,
+      `- Mode: ${item.meta.mode}`,
+      item.meta.stage ? `- Stage: ${item.meta.stage}` : "",
+      typeof item.meta.step === "number" ? `- Step: ${item.meta.step}` : "",
+      `- Model: ${item.meta.providerID}/${item.meta.modelID}`,
+      `- Tools: ${tools(item.meta.tools)}`,
+      item.meta.toolChoice ? `- Tool choice: ${item.meta.toolChoice}` : "",
+      item.meta.source ? `- Source: ${item.meta.source}` : "",
+      `- System prompts: ${item.system.length} (${chars(item.system)} chars)`,
+      item.instructions ? `- Instructions: ${chars(item.instructions)} chars` : "",
+      `- Messages: ${item.messages.length} (${chars(item.messages)} chars)`,
+      item.conversation ? `- Conversation: ${item.conversation.length} (${chars(item.conversation)} chars)` : "",
+    ].filter(Boolean)
+  }
+
+  function role(msg: MessageV2.WithParts) {
+    if (msg.info.role === "assistant") {
+      const info = msg.info as MessageV2.Assistant
+      return info.mode ? `assistant (${info.mode})` : "assistant"
+    }
+    return "user"
+  }
+
+  function summary(msg: MessageV2.WithParts) {
+    const parts = msg.parts
+      .filter((part): part is MessageV2.TextPart => part.type === "text" && !part.ignored)
+      .map((part) => part.text.trim())
+      .filter(Boolean)
+    if (parts.length === 0) return ""
+    return parts.join("\n\n")
+  }
+
+  function render(msgs: MessageV2.WithParts[], file: string) {
+    const reqs = msgs.flatMap((msg) =>
+      msg.parts
+        .filter((part): part is MessageV2.DebugPart => part.type === "debug")
+        .map((part) => ({
+          messageID: msg.info.id,
+          role: role(msg),
+          request: part.request,
+        })),
+    )
+    return [
+      "# Session Debug Snapshot",
+      "",
+      `Path: \`${file}\``,
+      "",
+      `Messages: ${msgs.length}`,
+      `Requests: ${reqs.length}`,
+      "",
+      "## Conversation",
+      "",
+      ...msgs.flatMap((msg) => {
+        const out = [`### ${role(msg)} ${msg.info.id}`]
+        const body = summary(msg)
+        const plan = decision(msg)
+        const meta = stats(msg)
+        if (body) out.push("", body)
+        if (meta.length > 0) out.push("", ...meta)
+        if (plan) out.push("", code("Decision", plan))
+        return [...out, ""]
+      }),
+      "## Requests",
+      "",
+      ...reqs.flatMap((item, idx) => [
+        `### Request ${idx + 1} ${item.messageID}`,
+        "",
+        `Role: ${item.role}`,
+        "",
+        ...request(item.request),
+        "",
+      ]),
+    ].join("\n")
+  }
+
+  /** @internal Exported for testing */
+  export function renderDebug(msgs: MessageV2.WithParts[], file: string) {
+    return render(msgs, file)
+  }
+
+  async function persist(part: MessageV2.DebugPart) {
+    const file = part.request.meta.file
+    if (!file) return
+    const msgs = await Session.messages({ sessionID: part.sessionID }).catch(() => [])
+    await Filesystem.write(file, render(msgs, file)).catch(() => {})
+  }
+
   export function create(input: {
     assistantMessage: MessageV2.Assistant
     sessionID: SessionID
@@ -83,11 +270,37 @@ export namespace SessionProcessor {
         log.info("process")
         needsCompaction = false
         const shouldBreak = (await Config.get()).experimental?.continue_loop_on_deny !== true
+        const base = {
+          meta: {
+            agent: streamInput.agent.name,
+            mode: streamInput.agent.mode,
+            providerID: input.model.providerID,
+            modelID: input.model.id,
+            userID: streamInput.user.id,
+            tools: Object.keys(streamInput.tools),
+            toolChoice: streamInput.toolChoice,
+            file: debugFile(input.sessionID),
+            source: streamInput.debug?.source,
+            stage: streamInput.debug?.stage,
+            step: streamInput.debug?.step,
+          },
+          system: streamInput.system,
+          messages: streamInput.messages,
+          conversation: streamInput.debug?.conversation,
+        }
         while (true) {
           try {
             let currentText: MessageV2.TextPart | undefined
             let reasoningMap: Record<string, MessageV2.ReasoningPart> = {}
-            const stream = await LLM.stream({
+            dbg = (await Session.updatePart({
+              id: dbg?.id ?? PartID.ascending(),
+              messageID: input.assistantMessage.id,
+              sessionID: input.assistantMessage.sessionID,
+              type: "debug",
+              request: base,
+            })) as MessageV2.DebugPart
+            await persist(dbg)
+            const stream = (await LLM.stream({
               ...streamInput,
               onRequest: async (req) => {
                 dbg = (await Session.updatePart({
@@ -95,10 +308,16 @@ export namespace SessionProcessor {
                   messageID: input.assistantMessage.id,
                   sessionID: input.assistantMessage.sessionID,
                   type: "debug",
-                  request: req,
+                  request: {
+                    ...base,
+                    system: req.system,
+                    instructions: req.instructions,
+                    messages: req.messages,
+                  },
                 })) as MessageV2.DebugPart
+                await persist(dbg)
               },
-            })
+            })) as LLM.StreamOutput & { experimental_output?: unknown }
 
             for await (const value of stream.fullStream) {
               input.abort.throwIfAborted()
@@ -358,6 +577,7 @@ export namespace SessionProcessor {
                     sessionID: input.assistantMessage.sessionID,
                     type: "text",
                     text: "",
+                    ignored: streamInput.debug?.stage === "planner",
                     time: {
                       start: Date.now(),
                     },
@@ -414,6 +634,9 @@ export namespace SessionProcessor {
               }
               if (needsCompaction) break
             }
+            if (streamInput.output && streamInput.onOutput) {
+              await streamInput.onOutput(stream.experimental_output)
+            }
           } catch (e: any) {
             log.error("process", {
               error: e,
@@ -463,6 +686,22 @@ export namespace SessionProcessor {
             snapshot = undefined
           }
           const p = await MessageV2.parts(input.assistantMessage.id)
+          if (
+            streamInput.debug?.stage === "executor" &&
+            !input.assistantMessage.finish &&
+            !input.assistantMessage.error &&
+            p.every((part) => part.type === "debug")
+          ) {
+            input.assistantMessage.error = MessageV2.fromError(
+              new Error("Executor stream ended before producing any output or tool calls."),
+              { providerID: input.model.providerID },
+            )
+            Bus.publish(Session.Event.Error, {
+              sessionID: input.assistantMessage.sessionID,
+              error: input.assistantMessage.error,
+            })
+            SessionStatus.set(input.sessionID, { type: "idle" })
+          }
           for (const part of p) {
             if (part.type === "tool" && part.state.status !== "completed" && part.state.status !== "error") {
               await Session.updatePart({

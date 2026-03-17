@@ -1,15 +1,74 @@
 import path from "path"
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { fileURLToPath } from "url"
+import type { Agent } from "../../src/agent/agent"
 import { Instance } from "../../src/project/instance"
+import type { Provider } from "../../src/provider/provider"
 import { ModelID, ProviderID } from "../../src/provider/schema"
 import { Session } from "../../src/session"
 import { MessageV2 } from "../../src/session/message-v2"
 import { SessionPrompt } from "../../src/session/prompt"
+import { ToolRegistry } from "../../src/tool/registry"
 import { Log } from "../../src/util/log"
 import { tmpdir } from "../fixture/fixture"
 
 Log.init({ print: false })
+
+const model = {
+  id: ModelID.make("test-model"),
+  providerID: ProviderID.make("test"),
+  api: {
+    id: "test-model",
+    url: "https://example.com",
+    npm: "@ai-sdk/openai",
+  },
+  name: "Test Model",
+  capabilities: {
+    temperature: true,
+    reasoning: false,
+    attachment: false,
+    toolcall: true,
+    input: {
+      text: true,
+      audio: false,
+      image: false,
+      video: false,
+      pdf: false,
+    },
+    output: {
+      text: true,
+      audio: false,
+      image: false,
+      video: false,
+      pdf: false,
+    },
+    interleaved: false,
+  },
+  cost: {
+    input: 0,
+    output: 0,
+    cache: {
+      read: 0,
+      write: 0,
+    },
+  },
+  limit: {
+    context: 0,
+    input: 0,
+    output: 0,
+  },
+  status: "active",
+  options: {},
+  headers: {},
+  release_date: "2026-01-01",
+} satisfies Provider.Model
+
+const agent = {
+  name: "build",
+  mode: "primary",
+  options: {},
+  permission: [{ permission: "*", pattern: "*", action: "allow" }],
+} satisfies Agent.Info
 
 describe("session.prompt missing file", () => {
   test("does not fail the prompt when a file part is missing", async () => {
@@ -145,6 +204,54 @@ describe("session.prompt special characters", () => {
         await Session.remove(session.id)
       },
     })
+  })
+})
+
+describe("session.prompt retry context", () => {
+  test("adds planner guidance for invalid apply_patch arguments", () => {
+    const retry = SessionPrompt.retryContext(
+      'Error: The apply_patch tool was called with invalid arguments: [{"path":["patchText"],"message":"Invalid input: expected string, received undefined"}]',
+      1,
+    )
+
+    expect(retry.executor).toContain("Executor_Observation: Error - ")
+    expect(retry.planner).toContain("apply_patch")
+    expect(retry.planner).toContain("schema exactly")
+  })
+
+  test("escalates repeated executor failures without hard-stopping", () => {
+    const retry = SessionPrompt.retryContext(
+      "Error: apply_patch verification failed: Failed to read file to update: /tmp/tests/test_tax_calculator.py",
+      3,
+    )
+
+    expect(retry.executor).toContain("Failed to read file to update")
+    expect(retry.planner).toContain("Use `glob`/`read` to confirm the path first")
+    expect(retry.planner).toContain("repeated the same failure 3 times")
+  })
+})
+
+describe("session.prompt planner capabilities", () => {
+  test("hides reserved tools from planner capabilities", async () => {
+    const spy = spyOn(ToolRegistry, "capabilities").mockResolvedValue([
+      { name: "invalid", capability: "Do not use" },
+      { name: "question", capability: "Ask the user" },
+      { name: "read", capability: "Read files" },
+    ])
+
+    try {
+      const caps = await SessionPrompt.plannerCapabilities({
+        agent,
+        model,
+        user: { tools: {} } as MessageV2.User,
+      })
+
+      expect(caps.names.has("invalid")).toBe(false)
+      expect(caps.names.has("question")).toBe(false)
+      expect(caps.names.has("read")).toBe(true)
+    } finally {
+      spy.mockRestore()
+    }
   })
 })
 

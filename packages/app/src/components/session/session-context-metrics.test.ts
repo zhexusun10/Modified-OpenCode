@@ -8,10 +8,12 @@ const assistant = (
   cost: number,
   providerID = "openai",
   modelID = "gpt-4.1",
+  mode = "build_executor",
 ) => {
   return {
     id,
     role: "assistant",
+    mode,
     providerID,
     modelID,
     cost,
@@ -67,6 +69,36 @@ describe("getSessionContextMetrics", () => {
     expect(metrics.context?.modelLabel).toBe("GPT-4.1")
   })
 
+  test("splits build stage metrics into plan and execute", () => {
+    const messages = [
+      assistant("a1", { input: 80, output: 20, reasoning: 10, read: 0, write: 0 }, 0.2, "openai", "gpt-4.1", "build_planner"),
+      assistant("a2", { input: 200, output: 40, reasoning: 30, read: 5, write: 0 }, 0.4, "openai", "gpt-4.1", "build_executor"),
+      assistant("a3", { input: 100, output: 25, reasoning: 15, read: 0, write: 0 }, 0.3, "openai", "gpt-4.1", "build_planner"),
+    ]
+    const providers = [
+      {
+        id: "openai",
+        name: "OpenAI",
+        models: {
+          "gpt-4.1": {
+            name: "GPT-4.1",
+            limit: { context: 1000 },
+          },
+        },
+      },
+    ]
+
+    const metrics = getSessionContextMetrics(messages, providers)
+
+    expect(metrics.context?.message.id).toBe("a3")
+    expect(metrics.stages.plan?.message.id).toBe("a3")
+    expect(metrics.stages.plan?.total).toBe(140)
+    expect(metrics.stages.plan?.usage).toBe(14)
+    expect(metrics.stages.execute?.message.id).toBe("a2")
+    expect(metrics.stages.execute?.total).toBe(275)
+    expect(metrics.stages.execute?.usage).toBe(28)
+  })
+
   test("preserves fallback labels and null usage when model metadata is missing", () => {
     const messages = [assistant("a1", { input: 40, output: 10, reasoning: 0, read: 0, write: 0 }, 0.1, "p-1", "m-1")]
     const providers = [{ id: "p-1", models: {} }]
@@ -97,5 +129,7 @@ describe("getSessionContextMetrics", () => {
 
     expect(metrics.totalCost).toBe(0)
     expect(metrics.context).toBeUndefined()
+    expect(metrics.stages.plan).toBeUndefined()
+    expect(metrics.stages.execute).toBeUndefined()
   })
 })

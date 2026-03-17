@@ -2,6 +2,7 @@ import { Installation } from "@/installation"
 import { Provider } from "@/provider/provider"
 import { Log } from "@/util/log"
 import {
+  Output,
   streamText,
   wrapLanguageModel,
   type ModelMessage,
@@ -27,6 +28,21 @@ export namespace LLM {
   const log = Log.create({ service: "llm" })
   export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
+  export function prelude(input: { prompt: string | undefined; isCodex: boolean; model: Provider.Model }) {
+    if (input.prompt !== undefined) {
+      return input.prompt ? [input.prompt] : []
+    }
+    if (input.isCodex) return []
+    return SystemPrompt.provider(input.model)
+  }
+
+  export type Debug = {
+    conversation?: unknown[]
+    source?: string
+    stage?: string
+    step?: number
+  }
+
   export type StreamInput = {
     user: MessageV2.User
     sessionID: string
@@ -39,6 +55,11 @@ export namespace LLM {
     tools: Record<string, Tool>
     retries?: number
     toolChoice?: "auto" | "required" | "none"
+    debug?: Debug
+    output?: {
+      schema: unknown
+    }
+    onOutput?: (output: unknown) => void | Promise<void>
     onRequest?: (input: { system: string[]; instructions?: string; messages: ModelMessage[] }) => void | Promise<void>
   }
 
@@ -70,7 +91,7 @@ export namespace LLM {
       [
         // use agent prompt otherwise provider prompt
         // For Codex sessions, skip SystemPrompt.provider() since it's sent via options.instructions
-        ...(input.agent.prompt ? [input.agent.prompt] : isCodex ? [] : SystemPrompt.provider(input.model)),
+        ...prelude({ prompt: input.agent.prompt, isCodex, model: input.model }),
         // any custom prompt passed into this call
         ...input.system,
         // any custom prompt from last user message
@@ -230,6 +251,11 @@ export namespace LLM {
         ...headers,
       },
       maxRetries: input.retries ?? 0,
+      experimental_output: input.output
+        ? Output.object({
+            schema: input.output.schema as any,
+          })
+        : undefined,
       messages: [
         ...system.map(
           (x): ModelMessage => ({

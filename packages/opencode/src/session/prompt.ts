@@ -54,31 +54,49 @@ import { mergeDeep } from "remeda"
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
 
-const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
-
-IMPORTANT:
-- You MUST call this tool exactly once at the end of your response
-- The input must be valid JSON matching the required schema
-- Complete all necessary research and tool calls BEFORE calling this tool
-- This tool provides your final answer - no further actions are taken after calling it`
-
-const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 const MAX_RETRIES = 3
 const EXECUTOR_ERROR = "Executor_Observation: Error - "
 const PLANNER_ERROR = "Planner_Observation: Error - "
 const EXECUTOR_CREATE = new Set(["edit", "write", "multiedit", "apply_patch", "skill"])
+const PLANNER_HIDDEN = new Set(["invalid", "question"])
 const PlannerDecision = z.object({
-  reasoning: z.string(),
-  planned_actions: z
-    .array(
-      z.object({
-        tool_name: z.string(),
-        intent: z.string(),
-      }),
-    )
-    .min(1),
+  completed_steps: z
+    .array(z.string())
+    .describe("List only progress already verified from the history. Never claim work is done unless it is actually done."),
+  remaining_steps: z
+    .array(z.string())
+    .describe("Stay high-level and short. Focus on the meaningful phases still left, not implementation details."),
+  current_step: z
+    .string()
+    .describe("Explain why the selected tools are the best immediate next move."),
+  selected_tools: z
+    .array(z.string())
+    .describe(
+      "Use the exact capability names for the current step as listed in Tool Capabilities, such as `read` or `grep`. Do not use namespaced forms like `functions.read`. Return an empty array when the task is complete and no more tool use is required.",
+    ),
 })
 type PlannerDecision = z.infer<typeof PlannerDecision>
+
+function retryHint(err: string, count: number) {
+  const note = []
+  if (err.includes("Invalid input: expected string, received undefined") && err.includes("patchText")) {
+    note.push(
+      "Executor called `apply_patch` with invalid arguments. Do not repeat the same edit immediately. Choose a smaller recovery step and ensure tool arguments match the schema exactly.",
+    )
+  }
+  if (err.includes("Failed to read file to update")) {
+    note.push(
+      "Executor attempted to update a missing file. Use `glob`/`read` to confirm the path first, or switch to a create-file flow such as `write` or an add-file patch instead of updating a missing file.",
+    )
+  }
+  if (count >= MAX_RETRIES) {
+    note.push(
+      `Executor repeated the same failure ${count} times. Stop repeating the same tool flow. Choose an observation-first recovery step before editing again.`,
+    )
+  }
+  if (note.length === 0) return
+  return `${PLANNER_ERROR}${note.join(" ")}`
+}
 
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
@@ -107,6 +125,14 @@ export namespace SessionPrompt {
   export function assertNotBusy(sessionID: SessionID) {
     const match = state()[sessionID]
     if (match) throw new Session.BusyError(sessionID)
+  }
+
+  /** @internal Exported for testing */
+  export function retryContext(err: string, count: number) {
+    return {
+      planner: retryHint(err, count),
+      executor: `${EXECUTOR_ERROR}${err}`,
+    }
   }
 
   export const PromptInput = z.object({
@@ -308,8 +334,6 @@ export namespace SessionPrompt {
     // Structured output state
     // Note: On session resumption, state is reset but outputFormat is preserved
     // on the user message and will be retrieved from lastUser below
-    let structuredOutput: unknown | undefined
-
     let step = 0
     const session = await Session.get(sessionID)
     while (true) {
@@ -667,16 +691,6 @@ export namespace SessionPrompt {
         messages: msgs,
       })
 
-      // Inject StructuredOutput tool if JSON schema mode enabled
-      if (lastUser.format?.type === "json_schema") {
-        tools["StructuredOutput"] = createStructuredOutputTool({
-          schema: lastUser.format.schema,
-          onSuccess(output) {
-            structuredOutput = output
-          },
-        })
-      }
-
       // Ephemerally wrap queued user messages with a reminder to stay on track
       if (step > 1 && lastFinished) {
         for (const msg of msgs) {
@@ -706,10 +720,8 @@ export namespace SessionPrompt {
         ...(await InstructionPrompt.system()),
       ]
       const format = lastUser.format ?? { type: "text" }
-      if (format.type === "json_schema") {
-        system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-      }
 
+      let structured: unknown | undefined
       const result = await processor.process({
         user: lastUser,
         agent,
@@ -729,16 +741,26 @@ export namespace SessionPrompt {
         ],
         tools,
         model,
-        toolChoice: format.type === "json_schema" ? "required" : undefined,
+        toolChoice: undefined,
+        output: format.type === "json_schema" ? { schema: format.schema } : undefined,
+        onOutput(output) {
+          structured = preferStructured(structured, output)
+        },
+        debug: {
+          conversation: msgs,
+          source: "prompt",
+          step,
+        },
       })
 
-      // If structured output was captured, save it and exit immediately
-      // This takes priority because the StructuredOutput tool was called successfully
-      if (structuredOutput !== undefined) {
-        processor.message.structured = structuredOutput
-        processor.message.finish = processor.message.finish ?? "stop"
-        await Session.updateMessage(processor.message)
-        break
+      if (format.type === "json_schema") {
+        structured = preferStructured(structured, await textStructured(processor.message.id))
+        if (structured !== undefined) {
+          processor.message.structured = structured
+          processor.message.finish = processor.message.finish ?? "stop"
+          await Session.updateMessage(processor.message)
+          break
+        }
       }
 
       // Check if model finished (finish reason is not "tool-calls" or "unknown")
@@ -746,9 +768,8 @@ export namespace SessionPrompt {
 
       if (modelFinished && !processor.message.error) {
         if (format.type === "json_schema") {
-          // Model stopped without calling StructuredOutput tool
           processor.message.error = new MessageV2.StructuredOutputError({
-            message: "Model did not produce structured output",
+            message: "Model did not produce valid JSON",
             retries: 0,
           }).toObject()
           await Session.updateMessage(processor.message)
@@ -855,6 +876,110 @@ export namespace SessionPrompt {
     return z.toJSONSchema(PlannerDecision) as Record<string, any>
   }
 
+  /** @internal Exported for testing */
+  export function plannerOutputSchema() {
+    return PlannerDecision
+  }
+
+  /** @internal Exported for testing */
+  export function preferStructured(current: unknown | undefined, next: unknown | undefined) {
+    return next === undefined ? current : next
+  }
+
+  function parseJson(input: string) {
+    try {
+      return JSON.parse(input)
+    } catch {}
+  }
+
+  function chunks(input: string) {
+    const out: string[] = []
+    let start = -1
+    let depth = 0
+    let quote = false
+    let esc = false
+    for (let i = 0; i < input.length; i++) {
+      const ch = input[i]
+      if (start === -1) {
+        if (ch === "{" || ch === "[") {
+          start = i
+          depth = 1
+          quote = false
+          esc = false
+        }
+        continue
+      }
+      if (quote) {
+        if (esc) {
+          esc = false
+          continue
+        }
+        if (ch === "\\") {
+          esc = true
+          continue
+        }
+        if (ch === '"') {
+          quote = false
+        }
+        continue
+      }
+      if (ch === '"') {
+        quote = true
+        continue
+      }
+      if (ch === "{" || ch === "[") {
+        depth++
+        continue
+      }
+      if (ch !== "}" && ch !== "]") continue
+      depth--
+      if (depth !== 0) continue
+      out.push(input.slice(start, i + 1))
+      start = -1
+    }
+    return out
+  }
+
+  function candidates(input: string) {
+    const value = input.trim()
+    if (!value) return []
+    const out = [value]
+    const fenced = value.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim()
+    if (fenced) out.push(fenced)
+    for (const item of [...out]) {
+      out.push(...chunks(item))
+    }
+    return Array.from(new Set(out.filter(Boolean)))
+  }
+
+  /** @internal Exported for testing */
+  export function parseStructuredText(input: string, test?: (value: unknown) => boolean) {
+    let last: unknown | undefined
+    for (const item of candidates(input)) {
+      const parsed = parseJson(item)
+      if (parsed === undefined) continue
+      if (!test) {
+        last = parsed
+        continue
+      }
+      if (test(parsed)) last = parsed
+    }
+    return last
+  }
+
+  async function textStructured(messageID: MessageID, test?: (value: unknown) => boolean, all?: boolean) {
+    const value = (await MessageV2.parts(messageID))
+      .filter(
+        (part): part is MessageV2.TextPart =>
+          part.type === "text" && !part.synthetic && (all === true || !part.ignored),
+      )
+      .map((part) => part.text.trim())
+      .filter(Boolean)
+      .join("\n")
+      .trim()
+    return parseStructuredText(value, test)
+  }
+
   function stageName(agent: Agent.Info, stage: "planner" | "executor") {
     return `${agent.name}_${stage}`
   }
@@ -865,11 +990,13 @@ export namespace SessionPrompt {
     input?: {
       temperature?: number
       options?: Record<string, any>
+      prompt?: string
     },
   ) {
     return {
       ...agent,
       name: stageName(agent, stage),
+      prompt: input?.prompt ?? agent.prompt,
       temperature: input?.temperature,
       options: mergeDeep(agent.options, input?.options ?? {}),
     }
@@ -892,21 +1019,29 @@ export namespace SessionPrompt {
     isLastStep: boolean
   }) {
     const mode = stageName(input.agent, input.stage)
+    const planner = stageName(input.agent, "planner")
     const msgs = await insertReminders({
       messages: await MessageV2.filterCompacted(MessageV2.stream(input.sessionID)),
       agent: input.agent,
       session: input.session,
     })
+    const filtered = msgs.filter((msg) => {
+      if (msg.info.role !== "assistant") return true
+      return (msg.info as MessageV2.Assistant).mode !== planner
+    })
 
-    for (const msg of msgs) {
+    for (const msg of filtered) {
       if (msg.info.role !== "assistant") continue
-      const assistant = msg.info as MessageV2.Assistant
-      msg.parts = msg.parts.filter((part) => part.type !== "reasoning" || assistant.mode === mode)
+      msg.parts = msg.parts.filter((part) => {
+        if (part.type === "reasoning") return false
+        if (part.type === "tool" && part.state.status === "error") return false
+        return true
+      })
     }
 
     let lastFinished: MessageV2.Assistant | undefined
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      const msg = msgs[i]
+    for (let i = filtered.length - 1; i >= 0; i--) {
+      const msg = filtered[i]
       if (msg.info.role === "assistant" && msg.info.finish) {
         lastFinished = msg.info as MessageV2.Assistant
         break
@@ -914,7 +1049,7 @@ export namespace SessionPrompt {
     }
 
     if (input.step > 1 && lastFinished) {
-      for (const msg of msgs) {
+      for (const msg of filtered) {
         if (msg.info.role !== "user" || msg.info.id <= lastFinished.id) continue
         for (const part of msg.parts) {
           if (part.type !== "text" || part.ignored || part.synthetic) continue
@@ -931,31 +1066,22 @@ export namespace SessionPrompt {
       }
     }
 
-    await Plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+    await Plugin.trigger("experimental.chat.messages.transform", {}, { messages: filtered })
 
-    return [
-      ...MessageV2.toModelMessages(msgs, input.model),
-      ...(input.isLastStep
-        ? [
-            {
-              role: "assistant" as const,
-              content: MAX_STEPS,
-            },
-          ]
-        : []),
-    ]
-  }
-
-  async function appendObservation(message: MessageV2.Assistant, text: string) {
-    await Session.updatePart({
-      id: PartID.ascending(),
-      messageID: message.id,
-      sessionID: message.sessionID,
-      type: "text",
-      text,
-      synthetic: true,
-      ignored: true,
-    })
+    return {
+      raw: filtered,
+      model: [
+        ...MessageV2.toModelMessages(filtered, input.model),
+        ...(input.isLastStep
+          ? [
+              {
+                role: "assistant" as const,
+                content: MAX_STEPS,
+              },
+            ]
+          : []),
+      ],
+    }
   }
 
   async function failRetries(message: MessageV2.Assistant, error: string) {
@@ -972,21 +1098,6 @@ export namespace SessionPrompt {
     )
     if (!part || part.state.status !== "error") return
     return part.state.error
-  }
-
-  async function prunePlannerOutput(message: MessageV2.Assistant) {
-    const parts = await MessageV2.parts(message.id)
-    await Promise.all(
-      parts
-        .filter((part): part is MessageV2.ToolPart => part.type === "tool" && part.tool === "StructuredOutput")
-        .map((part) =>
-          Session.removePart({
-            sessionID: message.sessionID,
-            messageID: message.id,
-            partID: part.id,
-          }),
-        ),
-    )
   }
 
   async function stageRun(input: {
@@ -1006,6 +1117,8 @@ export namespace SessionPrompt {
     options?: Record<string, any>
     format?: MessageV2.OutputFormat
     toolChoice?: "auto" | "required" | "none"
+    nativeOutput?: boolean
+    nativeSchema?: unknown
   }) {
     let structured: unknown | undefined
     const processor = SessionProcessor.create({
@@ -1042,50 +1155,60 @@ export namespace SessionPrompt {
 
     const tools = { ...input.tools }
     const format = input.format ?? { type: "text" as const }
-    if (format.type === "json_schema") {
-      tools["StructuredOutput"] = createStructuredOutputTool({
-        schema: format.schema,
-        onSuccess(output) {
-          structured = output
-        },
-      })
-    }
 
+    const convo = await stageMessages({
+      sessionID: input.sessionID,
+      session: input.session,
+      agent: input.agent,
+      stage: input.stage,
+      model: input.model,
+      step: input.step,
+      isLastStep: input.isLastStep,
+    })
     const result = await processor.process({
       user: stageUser(input.parent, input.variant),
       agent: stageAgent(input.agent, input.stage, {
+        prompt: "",
         temperature: input.temperature,
         options: input.options,
       }),
       abort: input.abort,
       sessionID: input.sessionID,
       system: [
+        input.system,
         ...(await SystemPrompt.environment(input.model)),
         ...(await InstructionPrompt.system()),
-        ...(format.type === "json_schema" ? [STRUCTURED_OUTPUT_SYSTEM_PROMPT] : []),
-        input.system,
       ],
-      messages: await stageMessages({
-        sessionID: input.sessionID,
-        session: input.session,
-        agent: input.agent,
-        stage: input.stage,
-        model: input.model,
-        step: input.step,
-        isLastStep: input.isLastStep,
-      }),
+      messages: convo.model,
       tools,
       model: input.model,
-      toolChoice: input.toolChoice ?? (format.type === "json_schema" ? "required" : undefined),
+      toolChoice:
+        input.toolChoice,
+      debug: {
+        conversation: convo.raw,
+        source: "stage",
+        stage: input.stage,
+        step: input.step,
+      },
+      output:
+        input.nativeOutput && format.type === "json_schema"
+          ? {
+              schema: input.nativeSchema ?? format.schema,
+            }
+          : undefined,
+      onOutput(output) {
+        structured = preferStructured(structured, output)
+      },
     })
+
+    if (format.type === "json_schema") {
+      structured = preferStructured(structured, await textStructured(processor.message.id))
+    }
 
     if (structured !== undefined) {
       processor.message.structured = structured
       processor.message.finish = processor.message.finish ?? "stop"
       await Session.updateMessage(processor.message)
-      if (input.stage === "planner") {
-        await prunePlannerOutput(processor.message)
-      }
     }
 
     return {
@@ -1095,7 +1218,8 @@ export namespace SessionPrompt {
     }
   }
 
-  async function plannerCapabilities(input: {
+  /** @internal Exported for testing */
+  export async function plannerCapabilities(input: {
     agent: Agent.Info
     model: Provider.Model
     user: MessageV2.User
@@ -1113,9 +1237,11 @@ export namespace SessionPrompt {
         .filter(([, enabled]) => enabled === false)
         .map(([name]) => name),
     )
-    const tools = local.filter((item) => !blocked.has(item.name) && !disabled.has(item.name))
+    const tools = local.filter(
+      (item) => !PLANNER_HIDDEN.has(item.name) && !blocked.has(item.name) && !disabled.has(item.name),
+    )
     return {
-      tools: [...tools, { name: "FINISH", capability: "Finish the task and answer the user." }],
+      tools,
       names: new Set(tools.map((item) => item.name)),
     }
   }
@@ -1152,8 +1278,16 @@ export namespace SessionPrompt {
     isLastStep: boolean
     processor: Omit<Parameters<typeof resolveTools>[0], "processor" | "messages">
   }) {
-    let retries = 0
+    let ptries = 0
+    let etries = 0
+    let last = ""
     let state: PlannerDecision | undefined
+    let retry:
+      | {
+          planner?: string
+          executor?: string
+        }
+      | undefined
 
     while (true) {
       const caps = await plannerCapabilities({
@@ -1176,6 +1310,7 @@ export namespace SessionPrompt {
         system: SystemPrompt.planner({
           capabilities: caps.tools,
           state,
+          retry,
         }),
         temperature: 0.1,
         options: plannerOptions(input.model),
@@ -1184,47 +1319,56 @@ export namespace SessionPrompt {
           schema: plannerSchema(),
           retryCount: 0,
         },
+        nativeOutput: true,
+        nativeSchema: plannerOutputSchema(),
       })
 
       if (plan.result === "compact") return "compact" as const
       if (plan.processor.message.error) return "stop" as const
 
-      const parsed = PlannerDecision.safeParse(plan.structured)
+      const parsed = PlannerDecision.safeParse(
+        plan.structured ??
+          (await textStructured(
+            plan.processor.message.id,
+            (value) => PlannerDecision.safeParse(value).success,
+            true,
+          )),
+      )
       if (!parsed.success) {
-        await appendObservation(plan.processor.message, `${PLANNER_ERROR}${parsed.error.message}`)
-        retries++
-        if (retries >= MAX_RETRIES) {
+        retry = {
+          ...retry,
+          planner: `${PLANNER_ERROR}${parsed.error.message}`,
+        }
+        ptries++
+        if (ptries >= MAX_RETRIES) {
           await failRetries(plan.processor.message, `Planner failed after ${MAX_RETRIES} attempts: ${parsed.error.message}`)
         }
         continue
       }
 
       state = parsed.data
+      ptries = 0
+      retry = retry?.executor ? { executor: retry.executor } : undefined
       if (input.isLastStep) {
         state = {
-          reasoning: state.reasoning,
-          planned_actions: [
-            {
-              tool_name: "FINISH",
-              intent: "We have reached the final step and should answer the user.",
-            },
-          ],
+          completed_steps: state.completed_steps,
+          remaining_steps: state.remaining_steps,
+          current_step: state.current_step,
+          selected_tools: [],
         }
       }
 
-      const names = Array.from(new Set<string>(state.planned_actions.map((item) => item.tool_name)))
-      const finish = names.includes("FINISH")
-      const invalid = names.filter((name) => name !== "FINISH" && !caps.names.has(name))
-      if (names.length === 0 || (finish && names.length > 1) || invalid.length > 0) {
-        const error =
-          invalid.length > 0
-            ? `Unknown tools: ${invalid.join(", ")}`
-            : finish && names.length > 1
-              ? 'FINISH cannot be combined with other tools'
-              : "planned_actions must contain at least one tool"
-        await appendObservation(plan.processor.message, `${PLANNER_ERROR}${error}`)
-        retries++
-        if (retries >= MAX_RETRIES) {
+      const names = Array.from(new Set<string>(state.selected_tools))
+      const finish = names.length === 0
+      const invalid = names.filter((name) => !caps.names.has(name))
+      if (invalid.length > 0) {
+        const error = `Unknown tools: ${invalid.join(", ")}`
+        retry = {
+          ...retry,
+          planner: `${PLANNER_ERROR}${error}`,
+        }
+        ptries++
+        if (ptries >= MAX_RETRIES) {
           await failRetries(plan.processor.message, `Planner failed after ${MAX_RETRIES} attempts: ${error}`)
         }
         continue
@@ -1241,9 +1385,12 @@ export namespace SessionPrompt {
             })
 
       if (!finish && !selected) {
-        await appendObservation(plan.processor.message, `${PLANNER_ERROR}Selected tools are unavailable: ${names.join(", ")}`)
-        retries++
-        if (retries >= MAX_RETRIES) {
+        retry = {
+          ...retry,
+          planner: `${PLANNER_ERROR}Selected tools are unavailable: ${names.join(", ")}`,
+        }
+        ptries++
+        if (ptries >= MAX_RETRIES) {
           await failRetries(plan.processor.message, `Planner failed after ${MAX_RETRIES} attempts: selected tools are unavailable`)
         }
         continue
@@ -1263,7 +1410,6 @@ export namespace SessionPrompt {
         isLastStep: input.isLastStep,
         system: SystemPrompt.executor({
           handoff: state,
-          tools: selected?.selected ?? [],
         }),
         temperature: create ? undefined : 0.1,
         options: executorOptions(input.model, create),
@@ -1275,14 +1421,18 @@ export namespace SessionPrompt {
 
       const err = exec.processor.message.error?.data?.message ?? (await firstToolError(exec.processor.message.id))
       if (err) {
-        await appendObservation(exec.processor.message, `${EXECUTOR_ERROR}${err}`)
-        retries++
-        if (retries >= MAX_RETRIES) {
-          await failRetries(exec.processor.message, `Executor failed after ${MAX_RETRIES} attempts: ${err}`)
+        etries = err === last ? etries + 1 : 1
+        last = err
+        retry = retryContext(err, etries)
+        if (etries >= MAX_RETRIES) {
+          state = undefined
+          etries = 0
         }
         continue
       }
 
+      etries = 0
+      last = ""
       if (finish) return "stop" as const
       return "continue" as const
     }
@@ -1480,36 +1630,6 @@ export namespace SessionPrompt {
     }
 
     return tools
-  }
-
-  /** @internal Exported for testing */
-  export function createStructuredOutputTool(input: {
-    schema: Record<string, any>
-    onSuccess: (output: unknown) => void
-  }): AITool {
-    // Remove $schema property if present (not needed for tool input)
-    const { $schema, ...toolSchema } = input.schema
-
-    return tool({
-      id: "StructuredOutput" as any,
-      description: STRUCTURED_OUTPUT_DESCRIPTION,
-      inputSchema: jsonSchema(toolSchema as any),
-      async execute(args) {
-        // AI SDK validates args against inputSchema before calling execute()
-        input.onSuccess(args)
-        return {
-          output: "Structured output captured successfully.",
-          title: "Structured Output",
-          metadata: { valid: true },
-        }
-      },
-      toModelOutput(result) {
-        return {
-          type: "text",
-          value: result.output,
-        }
-      },
-    })
   }
 
   async function createUserMessage(input: PromptInput) {

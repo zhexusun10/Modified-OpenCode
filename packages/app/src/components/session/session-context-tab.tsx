@@ -14,6 +14,7 @@ import type { Message, Part, UserMessage } from "@opencode-ai/sdk/v2/client"
 import { useLanguage } from "@/context/language"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { getSessionContextMetrics } from "./session-context-metrics"
+import type { SessionContextMetricsContext } from "./session-context-metrics"
 import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import { createSessionContextFormatter } from "./session-context-format"
 
@@ -63,6 +64,17 @@ function debug(parts: Part[]) {
   return parts.find((part): part is Extract<Part, { type: "debug" }> => part.type === "debug")
 }
 
+function scrub(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(scrub)
+  if (!value || typeof value !== "object") return value
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !key.toLowerCase().includes("encrypted"))
+      .map(([key, item]) => [key, scrub(item)]),
+  )
+}
+
 function RawMessageContent(props: { item: RawItem; getParts: (id: string) => Part[]; onRendered: () => void }) {
   const file = createMemo(() => {
     if (props.item.kind === "system") {
@@ -102,7 +114,7 @@ function RawMessageContent(props: { item: RawItem; getParts: (id: string) => Par
     }
 
     const parts = props.getParts(props.item.message.id)
-    const contents = JSON.stringify({ message: props.item.message, parts }, null, 2)
+    const contents = JSON.stringify(scrub({ message: props.item.message, parts }), null, 2)
     return {
       name: `${props.item.message.role}-${props.item.message.id}.json`,
       contents,
@@ -148,6 +160,56 @@ function RawMessage(props: {
         </div>
       </Accordion.Content>
     </Accordion.Item>
+  )
+}
+
+function BreakdownBar(props: {
+  title: string
+  segments: ReturnType<typeof estimateSessionContextBreakdown>
+  label: (key: SessionContextBreakdownKey) => string
+  intl: string
+  note: string
+}) {
+  return (
+    <div class="flex flex-col gap-2">
+      <div class="text-12-medium text-text-strong">{props.title}</div>
+      <div class="h-2 w-full rounded-full bg-surface-base overflow-hidden flex">
+        <For each={props.segments}>
+          {(segment) => (
+            <div
+              class="h-full"
+              style={{
+                width: `${segment.width}%`,
+                "background-color": BREAKDOWN_COLOR[segment.key],
+              }}
+            />
+          )}
+        </For>
+      </div>
+      <div class="flex flex-wrap gap-x-3 gap-y-1">
+        <For each={props.segments}>
+          {(segment) => (
+            <div class="flex items-center gap-1 text-11-regular text-text-weak">
+              <div class="size-2 rounded-sm" style={{ "background-color": BREAKDOWN_COLOR[segment.key] }} />
+              <div>{props.label(segment.key)}</div>
+              <div class="text-text-weaker">{segment.percent.toLocaleString(props.intl)}%</div>
+            </div>
+          )}
+        </For>
+      </div>
+      <div class="hidden text-11-regular text-text-weaker">{props.note}</div>
+    </div>
+  )
+}
+
+function PromptBlock(props: { title: string; text: string }) {
+  return (
+    <div class="flex flex-col gap-2">
+      <div class="text-12-medium text-text-strong">{props.title}</div>
+      <div class="border border-border-base rounded-md bg-surface-base px-3 py-2">
+        <Markdown text={props.text} class="text-12-regular" />
+      </div>
+    </div>
   )
 }
 
@@ -198,6 +260,8 @@ export function SessionContextTab() {
 
   const metrics = createMemo(() => getSessionContextMetrics(messages(), sync.data.provider.all))
   const ctx = createMemo(() => metrics().context)
+  const plan = createMemo(() => metrics().stages.plan)
+  const exec = createMemo(() => metrics().stages.execute)
   const formatter = createMemo(() => createSessionContextFormatter(language.intl()))
 
   const cost = createMemo(() => {
@@ -217,14 +281,9 @@ export function SessionContextTab() {
 
   const getParts = (id: string) => (sync.data.part[id] ?? []) as Part[]
 
-  const systemPrompt = createMemo(() => {
-    const part = findLast(messages(), (message) => {
-      if (message.role !== "assistant") return false
-      const req = debug(getParts(message.id))?.request
-      return !!req?.system.length || !!req?.instructions?.trim()
-    })
-    if (part?.role === "assistant") {
-      const req = debug(getParts(part.id))?.request
+  const promptFor = (id?: string) => {
+    if (id) {
+      const req = debug(getParts(id))?.request
       const system = req?.system.join("\n\n").trim()
       const instructions = req?.instructions?.trim()
       const text = [system ? "## System\n\n" + system : "", instructions ? "## Instructions\n\n" + instructions : ""]
@@ -232,14 +291,24 @@ export function SessionContextTab() {
         .join("\n\n")
       if (text) return text
     }
-
     const msg = findLast(visibleUserMessages(), (m) => !!m.system)
     const system = msg?.system
     if (!system) return
     const trimmed = system.trim()
     if (!trimmed) return
     return trimmed
+  }
+
+  const systemPrompt = createMemo(() => {
+    const part = findLast(messages(), (message) => {
+      if (message.role !== "assistant") return false
+      const req = debug(getParts(message.id))?.request
+      return !!req?.system.length || !!req?.instructions?.trim()
+    })
+    return promptFor(part?.id)
   })
+  const planPrompt = createMemo(() => promptFor(plan()?.message.id))
+  const execPrompt = createMemo(() => promptFor(exec()?.message.id))
 
   const providerLabel = createMemo(() => {
     const c = ctx()
@@ -253,19 +322,34 @@ export function SessionContextTab() {
     return c.modelLabel
   })
 
-  const breakdown = createMemo(
+  const pair = (fmt: (value: SessionContextMetricsContext) => string) => {
+    const p = plan()
+    const e = exec()
+    return `Plan ${p ? fmt(p) : "—"} / Execute ${e ? fmt(e) : "—"}`
+  }
+
+  const breakdown = (value: SessionContextMetricsContext | undefined) => {
+    if (!value?.input) return []
+    return estimateSessionContextBreakdown({
+      messages: messages().filter((message) => message.id <= value.message.id),
+      parts: sync.data.part as Record<string, Part[] | undefined>,
+      input: value.input,
+      systemPrompt: promptFor(value.message.id),
+      messageID: value.message.id,
+    })
+  }
+
+  const planBreakdown = createMemo(
     on(
-      () => [ctx()?.message.id, ctx()?.input, messages().length, systemPrompt()],
-      () => {
-        const c = ctx()
-        if (!c?.input) return []
-        return estimateSessionContextBreakdown({
-          messages: messages(),
-          parts: sync.data.part as Record<string, Part[] | undefined>,
-          input: c.input,
-          systemPrompt: systemPrompt(),
-        })
-      },
+      () => [plan()?.message.id, plan()?.input, messages().length],
+      () => breakdown(plan()),
+    ),
+  )
+
+  const execBreakdown = createMemo(
+    on(
+      () => [exec()?.message.id, exec()?.input, messages().length],
+      () => breakdown(exec()),
     ),
   )
 
@@ -283,14 +367,14 @@ export function SessionContextTab() {
     { label: "context.stats.provider", value: providerLabel },
     { label: "context.stats.model", value: modelLabel },
     { label: "context.stats.limit", value: () => formatter().number(ctx()?.limit) },
-    { label: "context.stats.totalTokens", value: () => formatter().number(ctx()?.total) },
-    { label: "context.stats.usage", value: () => formatter().percent(ctx()?.usage) },
-    { label: "context.stats.inputTokens", value: () => formatter().number(ctx()?.input) },
-    { label: "context.stats.outputTokens", value: () => formatter().number(ctx()?.output) },
-    { label: "context.stats.reasoningTokens", value: () => formatter().number(ctx()?.reasoning) },
+    { label: "context.stats.totalTokens", value: () => pair((value) => formatter().number(value.total)) },
+    { label: "context.stats.usage", value: () => pair((value) => formatter().percent(value.usage)) },
+    { label: "context.stats.inputTokens", value: () => pair((value) => formatter().number(value.input)) },
+    { label: "context.stats.outputTokens", value: () => pair((value) => formatter().number(value.output)) },
+    { label: "context.stats.reasoningTokens", value: () => pair((value) => formatter().number(value.reasoning)) },
     {
       label: "context.stats.cacheTokens",
-      value: () => `${formatter().number(ctx()?.cacheRead)} / ${formatter().number(ctx()?.cacheWrite)}`,
+      value: () => pair((value) => `${formatter().number(value.cacheRead)} / ${formatter().number(value.cacheWrite)}`),
     },
     { label: "context.stats.userMessages", value: () => counts().user.toLocaleString(language.intl()) },
     { label: "context.stats.assistantMessages", value: () => counts().assistant.toLocaleString(language.intl()) },
@@ -302,6 +386,7 @@ export function SessionContextTab() {
   let scroll: HTMLDivElement | undefined
   let frame: number | undefined
   let pending: { x: number; y: number } | undefined
+  let lock = false
   const raw = createMemo(
     () =>
       messages().flatMap((message) => {
@@ -352,6 +437,7 @@ export function SessionContextTab() {
   )
 
   const restoreScroll = () => {
+    if (lock) return
     const el = scroll
     if (!el) return
 
@@ -363,9 +449,12 @@ export function SessionContextTab() {
   }
 
   const handleScroll = (event: Event & { currentTarget: HTMLDivElement }) => {
+    const el = event.currentTarget
+    const bottom = el.scrollHeight - (el.scrollTop + el.clientHeight)
+    lock = bottom > 16
     pending = {
-      x: event.currentTarget.scrollLeft,
-      y: event.currentTarget.scrollTop,
+      x: el.scrollLeft,
+      y: el.scrollTop,
     }
     if (frame !== undefined) return
 
@@ -411,46 +500,28 @@ export function SessionContextTab() {
           </For>
         </div>
 
-        <Show when={breakdown().length > 0}>
-          <div class="flex flex-col gap-2">
+        <Show when={planBreakdown().length > 0 || execBreakdown().length > 0}>
+          <div class="flex flex-col gap-4">
             <div class="text-12-regular text-text-weak">{language.t("context.breakdown.title")}</div>
-            <div class="h-2 w-full rounded-full bg-surface-base overflow-hidden flex">
-              <For each={breakdown()}>
-                {(segment) => (
-                  <div
-                    class="h-full"
-                    style={{
-                      width: `${segment.width}%`,
-                      "background-color": BREAKDOWN_COLOR[segment.key],
-                    }}
-                  />
-                )}
-              </For>
-            </div>
-            <div class="flex flex-wrap gap-x-3 gap-y-1">
-              <For each={breakdown()}>
-                {(segment) => (
-                  <div class="flex items-center gap-1 text-11-regular text-text-weak">
-                    <div class="size-2 rounded-sm" style={{ "background-color": BREAKDOWN_COLOR[segment.key] }} />
-                    <div>{breakdownLabel(segment.key)}</div>
-                    <div class="text-text-weaker">{segment.percent.toLocaleString(language.intl())}%</div>
-                  </div>
-                )}
-              </For>
-            </div>
-            <div class="hidden text-11-regular text-text-weaker">{language.t("context.breakdown.note")}</div>
+            <Show when={planBreakdown().length > 0}>
+              <BreakdownBar
+                title="Plan"
+                segments={planBreakdown()}
+                label={breakdownLabel}
+                intl={language.intl()}
+                note={language.t("context.breakdown.note")}
+              />
+            </Show>
+            <Show when={execBreakdown().length > 0}>
+              <BreakdownBar
+                title="Execute"
+                segments={execBreakdown()}
+                label={breakdownLabel}
+                intl={language.intl()}
+                note={language.t("context.breakdown.note")}
+              />
+            </Show>
           </div>
-        </Show>
-
-        <Show when={systemPrompt()}>
-          {(prompt) => (
-            <div class="flex flex-col gap-2">
-              <div class="text-12-regular text-text-weak">{language.t("context.systemPrompt.title")}</div>
-              <div class="border border-border-base rounded-md bg-surface-base px-3 py-2">
-                <Markdown text={prompt()} class="text-12-regular" />
-              </div>
-            </div>
-          )}
         </Show>
 
         <div class="flex flex-col gap-2">

@@ -466,7 +466,7 @@ function renderable(part: PartType, showReasoningSummaries = true) {
     if (part.tool === "question") return part.state.status !== "pending" && part.state.status !== "running"
     return true
   }
-  if (part.type === "text") return !!part.text?.trim()
+  if (part.type === "text") return !part.ignored && !!part.text?.trim()
   if (part.type === "reasoning") return showReasoningSummaries && !!part.text?.trim()
   return !!PART_MAPPING[part.type]
 }
@@ -895,7 +895,10 @@ export function UserMessageDisplay(props: { message: UserMessage; parts: PartTyp
   const busy = () => state.busy
 
   const textPart = createMemo(
-    () => props.parts?.find((p) => p.type === "text" && !(p as TextPart).synthetic) as TextPart | undefined,
+    () =>
+      props.parts?.find((p) => p.type === "text" && !(p as TextPart).synthetic && !(p as TextPart).ignored) as
+        | TextPart
+        | undefined,
   )
 
   const text = createMemo(() => textPart()?.text || "")
@@ -1359,7 +1362,7 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
   const throttledText = createThrottledValue(displayText)
   const isLastTextPart = createMemo(() => {
     const last = (data.store.part?.[props.message.id] ?? [])
-      .filter((item): item is TextPart => item?.type === "text" && !!item.text?.trim())
+      .filter((item): item is TextPart => item?.type === "text" && !item.ignored && !!item.text?.trim())
       .at(-1)
     return last?.id === part().id
   })
