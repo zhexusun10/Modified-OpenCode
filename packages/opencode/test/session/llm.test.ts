@@ -75,14 +75,15 @@ describe("session.llm.prelude", () => {
     ])
   })
 
-  test("uses provider header when prompt is absent", () => {
-    expect(LLM.prelude({ prompt: undefined, isCodex: false, model: headerModel })).toStrictEqual(
-      SystemPrompt.provider(headerModel),
-    )
-  })
-
-  test("skips provider header for codex when prompt is absent", () => {
+  test("does not inject provider header when prompt is absent", () => {
+    expect(LLM.prelude({ prompt: undefined, isCodex: false, model: headerModel })).toStrictEqual([])
     expect(LLM.prelude({ prompt: undefined, isCodex: true, model: headerModel })).toStrictEqual([])
+  })
+})
+
+describe("session.llm.codexInstructions", () => {
+  test("trims blank extra instructions", () => {
+    expect(LLM.codexInstructions("  \nplanner\n  ")).toBe("planner")
   })
 })
 

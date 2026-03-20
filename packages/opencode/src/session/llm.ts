@@ -32,8 +32,11 @@ export namespace LLM {
     if (input.prompt !== undefined) {
       return input.prompt ? [input.prompt] : []
     }
-    if (input.isCodex) return []
-    return SystemPrompt.provider(input.model)
+    return []
+  }
+
+  export function codexInstructions(extra?: string) {
+    return extra?.trim()
   }
 
   export type Debug = {
@@ -49,6 +52,7 @@ export namespace LLM {
     model: Provider.Model
     agent: Agent.Info
     system: string[]
+    instructions?: string
     abort: AbortSignal
     messages: ModelMessage[]
     small?: boolean
@@ -129,10 +133,8 @@ export namespace LLM {
       mergeDeep(input.agent.options),
       mergeDeep(variant),
     )
-    const instructions = isCodex ? SystemPrompt.instructions() : undefined
-    if (instructions) {
-      options.instructions = instructions
-    }
+    const instructions = isCodex ? codexInstructions(input.instructions) : undefined
+    if (instructions !== undefined) options.instructions = instructions
 
     const params = await Plugin.trigger(
       "chat.params",

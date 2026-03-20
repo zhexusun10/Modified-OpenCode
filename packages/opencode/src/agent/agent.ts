@@ -320,10 +320,10 @@ export namespace Agent {
     } satisfies Parameters<typeof generateObject>[0]
 
     if (defaultModel.providerID === "openai" && (await Auth.get(defaultModel.providerID))?.type === "oauth") {
-      const result = streamObject({
+        const result = streamObject({
         ...params,
         providerOptions: ProviderTransform.providerOptions(model, {
-          instructions: SystemPrompt.instructions(),
+          instructions: "",
           store: false,
         }),
         onError: () => {},

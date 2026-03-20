@@ -7,7 +7,6 @@ import PROMPT_ANTHROPIC_WITHOUT_TODO from "./prompt/qwen.txt"
 import PROMPT_BEAST from "./prompt/beast.txt"
 import PROMPT_GEMINI from "./prompt/gemini.txt"
 
-import PROMPT_CODEX from "./prompt/codex_header.txt"
 import PROMPT_EXECUTOR from "./prompt/executor.txt"
 import PROMPT_TRINITY from "./prompt/trinity.txt"
 import PROMPT_PLANNER from "./prompt/planner.txt"
@@ -34,12 +33,7 @@ export namespace SystemPrompt {
     return JSON.stringify(data, null, 2)
   }
 
-  export function instructions() {
-    return PROMPT_CODEX.trim()
-  }
-
   export function provider(model: Provider.Model) {
-    if (model.api.id.includes("gpt-5")) return [PROMPT_CODEX]
     if (model.api.id.includes("gpt-") || model.api.id.includes("o1") || model.api.id.includes("o3"))
       return [PROMPT_BEAST]
     if (model.api.id.includes("gemini-")) return [PROMPT_GEMINI]
